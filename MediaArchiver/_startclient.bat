@@ -1,0 +1,1 @@
+"C:\MSVC\Shared\Python36_64\python.exe" MediaArchiverClient.py %1
