@@ -84,13 +84,7 @@ class Daemon(watchdogEventCHandler):
         while(len(self.__fileAddQueue) > 0):
             t = self.__fileAddQueue.pop()
             for f in t:
-                id = self._NeedArchive(f[0])
-                if id > 0:
-                    self.__ds.AddArchive(id, f[1], f[0], None)
-                elif id == 0:
-                    self.__ds.AddMediaFile([f])
-                else:
-                    self.__logger.debug("File %s ignored", f[0])
+                self._HandleFile(f[0], f[1], f[2])
 
         while(len(self.__fileMovedQueue) > 0):
             t = self.__fileMovedQueue.pop()
@@ -119,6 +113,65 @@ class Daemon(watchdogEventCHandler):
             self.__ds.AddArchive(id, size, dest, comment)
         except Exception as e:
             self.__logger.error("Error during moving archived file to destination or putting to DB: %s", e)
+
+    def _HandleFile(self, path, size, queue):
+        pf = os.path.splitext(path)
+        id = -1
+
+        if pf[0].endswith(self.__serverConfig.ArchivedFileSuffix):
+            srcFile = pf[0].replace(self.__serverConfig.ArchivedFileSuffix, "")
+            # look for original file with arbitrary extension present
+            # if yes, put that file into source table and get the id
+            # if not, we consider having no original file anymore, leave id=0
+            originalFile = glob.glob(srcFile + ".*")
+            origFileToAdd = srcFile
+            if len(originalFile) == 1:
+                origFileToAdd = originalFile[0]
+                id = self.__ds.TryGetIdOfSourceFile(origFileToAdd)
+
+            elif len(originalFile) > 1:
+                self.__logger.warn("More than 1 original file found for '%s'", path)
+                return
+
+            elif len(originalFile) < 1:
+                self.__logger.debug("No original file found for '%s'", path)
+
+            if id <= 0:
+                tupleToAdd=(origFileToAdd,0,False)
+                self.__ds.AddMediaFile([tupleToAdd])      # hack: add original file to media file list even if it does not exist
+                id = self.__ds.TryGetIdOfSourceFile(origFileToAdd)
+            
+            self.__ds.AddArchive(id, size, path, None)
+
+        else:
+            #  Stream #0:0[0x1011]: Video: h264
+            regex = re.compile(r"(?:Stream\s.*Video:\s*)(\w*)", re.MULTILINE | re.IGNORECASE)
+            #outputP = subprocess.run([self.__serverConfig.FFProbePath, "-i", path], stderr=subprocess.PIPE)
+            outputP = subprocess.Popen([self.__serverConfig.FFProbePath, path], stderr=subprocess.PIPE, stdout = subprocess.DEVNULL)
+            outputP.wait()
+            output = outputP.stderr.read(1024*1024).decode('utf-8')
+            matches = re.search(regex, output)
+            if outputP.returncode != 0:
+                self.__logger.debug("FFProbe return error: %s", output)
+            else:
+                if matches == None:
+                    self.__logger.error("File not supported by FFMpeg: %s", path)
+                elif len(matches.groups()) > 1:
+                    self.__logger.debug("File %s using has multiple video streams video codec %s", path, matches.groups())
+                else:
+                    codec = matches.group(1).upper()
+                    if not codec in self.__serverConfig.SkipFilesWithVideoCodec:
+                        id = 0
+                        self.__logger.debug("File %s using video codec %s", path, codec)
+                    else:
+                        self.__logger.debug("File %s ignored due to configuration", path)
+
+            if id == 0:
+                tupleToAdd=(path, size, queue)
+                self.__ds.AddMediaFile([tupleToAdd])
+            else:
+                self.__logger.debug("File %s ignored", path)
+
 
     def _NeedArchive(self, path):
         id = -1
