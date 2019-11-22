@@ -6,6 +6,10 @@ import re
 import subprocess
 import xmlrpc.server
 from os import path
+import errno
+import shutil
+import uuid
+import subprocess
 
 try:
     import watchdog
@@ -107,9 +111,45 @@ class Daemon(watchdogEventCHandler):
             except Exception as e:
                 self.__logger.error("Could not copy/add archived file: %s", e)
 
+    def __safe_move(self, src, dst):
+        """Rename a file from ``src`` to ``dst``.
+
+        *   Moves must be atomic.  ``shutil.move()`` is not atomic.
+            Note that multiple threads may try to write to the cache at once,
+            so atomicity is required to ensure the serving on one thread doesn't
+            pick up a partially saved image from another thread.
+
+        *   Moves must work across filesystems.  Often temp directories and the
+            cache directories live on different filesystems.  ``os.rename()`` can
+            throw errors if run across filesystems.
+
+        So we try ``os.rename()``, but if we detect a cross-filesystem copy, we
+        switch to ``shutil.move()`` with some wrappers to make it atomic.
+        """
+        try:
+            os.rename(src, dst)
+        except OSError as err:
+
+            if err.errno == errno.EXDEV:
+                # Generate a unique ID, and copy `<src>` to the target directory
+                # with a temporary name `<dst>.<ID>.tmp`.  Because we're copying
+                # across a filesystem boundary, this initial copy may not be
+                # atomic.  We intersperse a random UUID so if different processes
+                # are copying into `<dst>`, they don't overlap in their tmp copies.
+                copy_id = uuid.uuid4()
+                tmp_dst = "%s.%s.tmp" % (dst, copy_id)
+                cmd = ["mv", src, tmp_dst]
+                subprocess.check_output(cmd)
+
+                # Then do an atomic rename onto the new name, and clean up the
+                # source image.
+                os.rename(tmp_dst, dst)
+            else:
+                raise
+
     def __MoveFileAndAddToDatabase(self, src, dest, id, size, comment):
         try:
-            os.rename(src, dest)
+            self.__safe_move(src, dest)
             self.__ds.AddArchive(id, size, dest, comment)
         except Exception as e:
             self.__logger.error("Error during moving archived file to destination or putting to DB: %s", e)
